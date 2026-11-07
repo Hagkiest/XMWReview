@@ -674,6 +674,7 @@ async fn refresh_satisfaction(
         Some(&key),
         &items,
         satisfaction::DISCOVER_PAGES,
+        "manual",
     )
     .await;
     Ok(Json(json!({
@@ -1982,14 +1983,21 @@ async fn verify_composition(
     Json(body): Json<VerifyRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let token = session_ctx(&headers)?.token()?;
-    if !(1..=3).contains(&body.action) {
-        return Err(ApiError::BadRequest("请选择受理结果".to_string()));
+    // 作品只有两种结论：2 = 下架，3 = 正常显示。
+    if body.action != 2 && body.action != 3 {
+        return Err(ApiError::BadRequest("请选择受理结果：正常显示或下架".to_string()));
     }
     let remark = body.remark.trim();
     let reporter_message = body.reporter_message.trim();
+    let user_message = body.user_message.trim();
     if remark.is_empty() || reporter_message.is_empty() {
         return Err(ApiError::BadRequest(
             "受理备注和举报人站内信均为必填".to_string(),
+        ));
+    }
+    if body.action == 2 && user_message.is_empty() {
+        return Err(ApiError::BadRequest(
+            "下架需要填写被举报人站内信".to_string(),
         ));
     }
 
@@ -2012,6 +2020,7 @@ async fn verify_composition(
             &case,
             body.action,
             remark,
+            user_message,
             reporter_message,
         )
         .await

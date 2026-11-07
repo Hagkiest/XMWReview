@@ -317,6 +317,26 @@ export const TEMPLATES: Record<Action, { reporter: string; user: string }> = {
   },
 }
 
+/**
+ * 作品审核的动作值和评论不同：3 = 正常显示，2 = 下架。
+ * 下架必须给作者发站内信（userIsSend=1 + userMessage），正常显示不发。
+ */
+export const COMPOSITION_ACTIONS: { value: Action; label: string }[] = [
+  { value: 3, label: "正常显示" },
+  { value: 2, label: "下架" },
+]
+
+export const COMPOSITION_TEMPLATES: Record<2 | 3, { reporter: string; user: string }> = {
+  3: {
+    reporter: "感谢您对社区内容的正义维护，经核查该作品未发现违规。",
+    user: "",
+  },
+  2: {
+    reporter: "感谢您对社区内容的正义维护，您的举报已受理。",
+    user: "您的作品存在违规内容，已被系统管理员下线为未发布状态，请重新编辑信息后再进行发布，谢谢您的配合。",
+  },
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,

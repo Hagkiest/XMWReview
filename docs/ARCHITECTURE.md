@@ -73,21 +73,28 @@ token 既是调用社区接口的凭证，也是审核记录与偏好的归属�
 
 ```jsonc
 {
-  "reportId": 57880,
-  "reporterIsSend": 1,          // 作品提交时 userIsSend/reporterIsSend 都是 0/1 的固定组合
-  "userIsSend": 1,
-  "reportDetailIds": [80440],   // 来自 get-info 的 List[].id，不是案件号
-  "action": 3,                  // 1 正常显示 / 2 替换 / 3 删除
+  "reportId": 57886,
+  "reporterIsSend": 1,
+  "userIsSend": 0,              // 需要通知作者时才是 1（见下表）
+  "reportDetailIds": [80445],   // 只放 get-info list 的第一条（最新举报）的 id
+  "action": 3,
   "remark": "…",                // 上限 20 字，超了上游会拒
-  "userMessage": "…",
   "reporterMessage": "…"
+  // "userMessage": "…"         // 只有 userIsSend=1 时才有这个字段
 }
 ```
 
-- `reportDetailIds` **必须是该案件全部举报记录号**；漏了就只受理一部分。
-- 作品提交走 `/report/verify-composition`，且**不带 `userMessage`**、`userIsSend: 0`。
-- 评论走 `/report/verify-comment`。
-- `community.rs::verify_case` 会重新拉详情收集这些 id；`verify_report` 复用已有详情。
+动作取值两套，**不要混用**：
+
+| 模式 | 正常显示 | 其它 | 站内信 |
+| --- | --- | --- | --- |
+| 评论 `/report/verify-comment` | `action=1` | `2` 替换、`3` 删除 | 正常显示 `userIsSend=0` 且不带 `userMessage`；2/3 必须带 |
+| 作品 `/report/verify-composition` | `action=3` | `2` 下架 | 正常显示 `userIsSend=0` 且不带 `userMessage`；下架必须带，缺了上游回「无权限」 |
+
+- `reportDetailIds` 只放 **`get-info` 返回 `list` 的第一条**（按举报时间倒序，最新在前）的 `id`，
+  不是案件号，也不是全部举报记录。
+- 请求体由 `community.rs::comment_verify_body` / `composition_verify_body` 统一构造，
+  两个函数都有单测锁住形状，改之前先看测试。
   后台自动审核走的是同一对函数，别在处理器里另写一份拼装逻辑。
 
 ## AI 建议
@@ -117,9 +124,18 @@ token 既是调用社区接口的凭证，也是审核记录与偏好的归属�
 - 写盘在锁内做**全量重写**，量级只有几百条，不值得上数据库。记录上千条再考虑换存储。
 
 满意度：`satisfaction = (其他用户赞同数) / (赞同 + 反对)`，其中赞同数要**减掉审核员自己那一票**，
-并且**不要相信上游的 `userAgreeRatio`**（口径和计数对不上）。提交满 24 小时才允许取
-（`records.rs::REFRESH_MS`），后台每 10 分钟扫 12 条（`satisfaction.rs`）。
-作品审核不抓满意度。
+并且**不要相信上游的 `userAgreeRatio`**（口径和计数对不上）。作品审核不抓满意度。
+
+取数流程（`community.rs` + `satisfaction.rs`）：
+
+1. `POST /japi/v1/judgement/listJudgedReport`，固定 `{"reportType":3,"page":N,"pageSize":12}`，
+   用列表项的 `id`（= 案件号）匹配刚提交的案件，拿到 `judgeRecordId`；本页没有就翻页。
+2. `POST /japi/v1/judgement/myOpinion`，`{"agreeType":0,"judgeRecordId":X}`，取赞同/反对数。
+
+额度：**每个案件最多取两次——手动一次、系统一次**（`satisfaction_manual_used` /
+`satisfaction_auto_used`）。只有真正取到数值才算用掉；上游报错、还没人投票都**不消耗机会**，
+也不会覆盖已有的满意度。提交满 **5 小时**后后台才开始自动取（`records.rs::REFRESH_MS`），
+后台每 10 分钟扫 12 条；还没出判决的案件不会消耗机会，下一轮继续看。
 
 ## 两个后台循环
 

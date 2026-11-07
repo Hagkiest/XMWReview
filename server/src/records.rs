@@ -43,6 +43,12 @@ pub struct Record {
     /// 旧版本 pending 文件没有这个字段，所以带 default。
     #[serde(default)]
     pub satisfaction_at: i64,
+    /// 手动获取机会用掉了没有（真正取到值才算）。
+    #[serde(default)]
+    pub satisfaction_manual_used: bool,
+    /// 系统自动获取机会用掉了没有（真正取到值才算）。
+    #[serde(default)]
+    pub satisfaction_auto_used: bool,
     pub case_report_time: String,
     /// epoch 毫秒，前端直接 new Date() 用
     pub created_at: i64,
@@ -76,8 +82,8 @@ pub struct DueSatisfaction {
     pub judge_record_id: i64,
 }
 
-/// 满意度 / 判决号的刷新周期：和主版本的 SQL `INTERVAL '24 hours'` 对齐。
-const REFRESH_MS: i64 = 24 * 60 * 60 * 1000;
+/// 满意度 / 判决号的刷新周期：和主版本的 SQL `INTERVAL '5 hours'` 对齐。
+const REFRESH_MS: i64 = 5 * 60 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct RecordsStore {
@@ -175,21 +181,52 @@ impl RecordsStore {
     }
 
     /// 回填满意度（只更新当前归属键下的记录）。
+    /// `source`：manual = 界面手动获取，auto = 后台每日刷新；只有取到值才调用，用掉对应机会。
     pub async fn set_satisfaction_by_key(
         &self,
         account_key: &str,
         case_id: i64,
         judge_record_id: i64,
         satisfaction: Option<f32>,
+        source: &str,
     ) -> Result<(), String> {
         self.update(account_key, case_id, |record| {
             record.satisfaction = satisfaction;
             record.satisfaction_fetched = true;
             record.satisfaction_at = now_ms();
+            if source == "manual" {
+                record.satisfaction_manual_used = true;
+            } else {
+                record.satisfaction_auto_used = true;
+            }
             if judge_record_id > 0 {
                 record.judge_record_id = judge_record_id;
             }
         })
+    }
+
+    /// 每批案件的两次获取机会有没有用掉：(manual_used, auto_used)。
+    pub async fn satisfaction_slots(
+        &self,
+        account_key: &str,
+        case_ids: &[i64],
+    ) -> Result<HashMap<i64, (bool, bool)>, String> {
+        let mut slots = HashMap::new();
+        if case_ids.is_empty() {
+            return Ok(slots);
+        }
+        let guard = self.records();
+        if let Some(list) = guard.get(account_key) {
+            for record in list {
+                if case_ids.contains(&record.case_id) {
+                    slots.insert(
+                        record.case_id,
+                        (record.satisfaction_manual_used, record.satisfaction_auto_used),
+                    );
+                }
+            }
+        }
+        Ok(slots)
     }
 
     /// 记一次「已经尝试过」的时间：暂时取不到满意度时用，避免每轮都撞同一个案件。
@@ -212,6 +249,7 @@ impl RecordsStore {
         for (key, list) in guard.iter() {
             for record in list {
                 if record.action == 1
+                    || record.satisfaction_auto_used
                     || record.created_at > deadline
                     || (record.satisfaction_at != 0 && record.satisfaction_at > deadline)
                 {
@@ -512,6 +550,8 @@ mod tests {
             satisfaction: None,
             satisfaction_fetched: false,
             satisfaction_at: 0,
+            satisfaction_manual_used: false,
+            satisfaction_auto_used: false,
             case_report_time: String::new(),
             created_at,
             token_masked: "ma…sk".to_string(),
@@ -584,7 +624,7 @@ mod tests {
         assert_eq!(list[0].case_id, 101);
 
         reloaded
-            .set_satisfaction_by_key(&key, 101, 555, Some(0.75))
+            .set_satisfaction_by_key(&key, 101, 555, Some(0.75), "manual")
             .await
             .unwrap();
         let (list, _) = reloaded.list_for(None, token, 50).await;

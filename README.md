@@ -127,7 +127,10 @@ AI_API_KEY=sk-...     # 不填就没有 AI 建议，人工审核照常
 
 ### 提交
 
-`reportDetailIds` 取 `/report/get-info` 返回的**全部**举报记录 id，多条举报一次提交完。
+- `reportDetailIds` 只放 `/report/get-info` 返回的 `list` **第一条**（最新那条）的 `id`。
+- 作品：`action=3` 正常显示（`userIsSend=0`，不带 `userMessage`）；
+  `action=2` 下架（`userIsSend=1`，**必须**带 `userMessage`，否则上游回「无权限」）。
+- 评论：`action=1` 正常显示（同样不发站内信），`2` 替换、`3` 删除需要 `userMessage`。
 
 ## HTTP 接口一览
 

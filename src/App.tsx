@@ -12,6 +12,8 @@ import {
 import {
   ACTIONS,
   ApiError,
+  COMPOSITION_ACTIONS,
+  COMPOSITION_TEMPLATES,
   TEMPLATES,
   createApi,
   type Action,
@@ -435,6 +437,16 @@ const actionLabel = (action: Action) =>
       action,
   )?.label ??
   ""
+
+/** 作品的受理结果只有「正常显示 / 下架」，标签和配色与评论不同。 */
+const compositionActionLabel = (action: Action) =>
+  COMPOSITION_ACTIONS.find(
+    (item) =>
+      item.value ===
+      action,
+  )?.label ?? actionLabel(action)
+const compositionTone = (action: Action) =>
+  action === 3 ? "tone-green" : action === 2 ? "tone-orange" : ACTION_TONE[action]
 const messageOf = (error: unknown) =>
   error instanceof
   Error
@@ -494,7 +506,7 @@ const sceneUrl = (compositionId: string) =>
   `https://world.xiaomawang.com/community/main/compose/${encodeURIComponent(compositionId)}`
 const isTemplate = (value: string, key: "user" | "reporter") =>
   !value.trim() ||
-  Object.values(TEMPLATES).some(
+  [...Object.values(TEMPLATES), ...Object.values(COMPOSITION_TEMPLATES)].some(
     (template) =>
       template[key] ===
       value.trim(),
@@ -1174,11 +1186,17 @@ function Console({
     }
     for (const item of cloudRecords ?? []) {
       const local = merged.get(item.caseId)
+      // 谁更新得更晚用谁的：刚手动取到的值不能被旧值盖掉（0 也是有效满意度）。
+      const localNewer =
+        (local?.satisfactionAt || 0) > (item.satisfactionAt || 0) &&
+        Boolean(local?.satisfactionFetched)
       merged.set(item.caseId, {
         ...item,
         // 服务端字段优先；服务端没有的用本机兜底（0 是有效满意度，只有 null 才兜底）。
         remark: item.remark || local?.remark || "",
-        satisfaction: item.satisfaction ?? local?.satisfaction ?? null,
+        satisfaction: localNewer
+          ? (local?.satisfaction ?? item.satisfaction ?? null)
+          : (item.satisfaction ?? local?.satisfaction ?? null),
         satisfactionFetched:
           item.satisfactionFetched || Boolean(local?.satisfactionFetched),
         satisfactionAt: Math.max(item.satisfactionAt || 0, local?.satisfactionAt || 0),
@@ -1485,7 +1503,7 @@ function Console({
       const now = Date.now()
       const due = historyEntries.filter((item) => {
         // 「正常显示」的判决没有删除评论，不抓取满意度。
-        if (item.action === 1) return false
+        if (Number(item.action) === 1) return false
         // 刚提交不到一天，满意度没有参考价值。
         if (now - item.createdAt < SATISFACTION_DELAY_MS) return false
         // 手动刷新：满一天的全部重取一遍。
@@ -1548,7 +1566,7 @@ function Console({
   /** 历史记录里单条手动获取满意度：不受“每天一次”限制，用户点一次就查一次。 */
   const fetchSatisfaction = useCallback(
     async (record: RecordEntry) => {
-      if (record.action === 1) {
+      if (Number(record.action) === 1) {
         notify("正常显示的案件不统计满意度", "error")
         return
       }
@@ -2131,6 +2149,12 @@ function Console({
       seen.set(item.id, item)
     return [...seen.values()]
   }, [normalCases, hiddenServerCases])
+  // 详情页的只读状态以列表为准；列表里没有该案件（如按案件号搜索）时为 null，退回详情字段。
+  const selectedClaimed = useMemo(() => {
+    if (selectedId === null) return null
+    const summary = allCases.find((item) => item.id === selectedId)
+    return summary ? !unclaimed(summary.checkerName) : null
+  }, [allCases, selectedId])
   const matchesQuery = useCallback(
     (item: CaseSummary, keyword: string) =>
       !keyword ||
@@ -2890,12 +2914,7 @@ function Console({
                 onModeChange={setMode}
                 aiEnabled={canUseAi}
                 demo={demo}
-                claimed={
-                  !unclaimed(
-                    allCases.find((item) => item.id === selectedId)
-                      ?.checkerName ?? "",
-                  )
-                }
+                claimed={selectedClaimed}
                 cachedSuggestion={suggestionCache.current.get(selectedId)}
                 onSuggestion={(data) => suggestionCache.current.set(selectedId, data)}
                 onBack={() => setSelectedId(null)}
@@ -3791,7 +3810,7 @@ function HistoryRow({
   onFetchSatisfaction: () => void
   onDelete: () => void
 }) {
-  const normalDisplay = record.action === 1
+  const normalDisplay = Number(record.action) === 1
   const ready = Date.now() - record.createdAt >= SATISFACTION_DELAY_MS
   const canFetch = !normalDisplay && ready
   const satisfaction = normalDisplay
@@ -3942,7 +3961,7 @@ function HistoryDetailDialog({
     }
   }, [api, record.caseId])
 
-  const normalDisplay = record.action === 1
+  const normalDisplay = Number(record.action) === 1
   const ready = Date.now() - record.createdAt >= SATISFACTION_DELAY_MS
   const satisfaction = normalDisplay
     ? "正常显示不统计满意度"
@@ -4163,8 +4182,8 @@ function ReviewPane({
   onModeChange: (mode: Mode) => void
   aiEnabled: boolean
   demo: boolean
-  /** 案件已被别的审核员认领：不再花配额分析。 */
-  claimed: boolean
+  /** 案件已被别的审核员认领：不再花配额分析。null = 列表里没有该案件，退回详情判断。 */
+  claimed: boolean | null
   cachedSuggestion?: Suggestion
   onSuggestion: (data: Suggestion) => void
   onBack: () => void
@@ -4200,8 +4219,12 @@ function ReviewPane({
   const [staleCase, setStaleCase] = useState(false)
   const edited = useRef(false)
   const alive = useRef(true)
+  // 只读状态以列表为准：多举报案件里详情自带的 checkerId / isDeal 属于旧的那条举报，
+  // 拿来判断整案会把还没人认领的案件锁成「只可查看」。列表里没有该案件时才退回详情字段。
+  const claimedByDetail = Boolean(detail?.isDeal) || Boolean(detail?.checkerId)
+  const claimedNow = claimed === null ? claimedByDetail : claimed
   // 已经被认领或已处理的案件只能查看，不能再改动或提交。
-  const readOnly = claimed || Boolean(detail?.isDeal) || staleCase
+  const readOnly = claimedNow || staleCase
 
   useEffect(() => {
     alive.current = true
@@ -4490,7 +4513,7 @@ function ReviewPane({
             {mode === "ai" && !staleCase && (
               <AiCard
                 enabled={aiEnabled}
-                claimed={claimed}
+                claimed={claimedNow}
                 state={suggestion}
                 onRetry={requestSuggestion}
                 onApply={applySuggestion}
@@ -4504,7 +4527,7 @@ function ReviewPane({
                     <Icon name={staleCase ? "clock" : "check"} size={15} />
                     {staleCase
                       ? "该案件举报已超过一周或举报时间无法确认，系统不会再分析或提交。"
-                      : `该案件已${detail?.isDeal ? "处理" : "被认领"}，仅可查看，不能再提交或修改。`}
+                      : "该案件已被认领，仅可查看，不能再提交或修改。"}
                   </p>
                 )}
                 <div className="form-row">
@@ -4553,7 +4576,7 @@ function ReviewPane({
                   {readOnly
                     ? staleCase
                       ? "超期案件只可查看"
-                      : "已处理案件只可查看"
+                      : "已被认领，只可查看"
                     : demo
                       ? "示例模式不会提交到社区"
                       : "提交后案件将归属当前审核员"}
@@ -4988,6 +5011,18 @@ function CompositionApp({
 
   const normalCases = useMemo(() => data?.list ?? [], [data])
   const hiddenCases = useMemo(() => data?.hiddenList ?? [], [data])
+  const allCases = useMemo(() => {
+    const seen = new Map<number, CaseSummary>()
+    for (const item of [...normalCases, ...hiddenCases])
+      seen.set(item.id, item)
+    return [...seen.values()]
+  }, [normalCases, hiddenCases])
+  // 详情页的只读状态以列表为准；列表里没有该案件时为 null，退回详情字段。
+  const selectedClaimed = useMemo(() => {
+    if (selectedId === null) return null
+    const summary = allCases.find((item) => item.id === selectedId)
+    return summary ? !unclaimed(summary.checkerName) : null
+  }, [allCases, selectedId])
   const normalTotal = data?.normalTotal ?? data?.total ?? 0
   const hiddenTotal = data?.hiddenTotal ?? 0
   const hiddenClaimed = data?.hiddenClaimedTotal ?? 0
@@ -5577,6 +5612,7 @@ function CompositionApp({
                 api={api}
                 caseId={selectedId}
                 demo={demo}
+                claimed={selectedClaimed}
                 onBack={() => setSelectedId(null)}
                 onSubmitted={handleSubmitted}
                 onError={fail}
@@ -5679,6 +5715,7 @@ function CompositionReviewPane({
   api,
   caseId,
   demo,
+  claimed,
   onBack,
   onSubmitted,
   onError,
@@ -5686,6 +5723,8 @@ function CompositionReviewPane({
   api: ReviewApi
   caseId: number
   demo: boolean
+  /** 列表给出的认领状态；null = 列表里没有该案件，退回详情字段判断。 */
+  claimed: boolean | null
   onBack: () => void
   onSubmitted: (info: {
     caseId: number
@@ -5731,21 +5770,25 @@ function CompositionReviewPane({
 
   const age = detail ? caseAgeOf(detail) : null
   const stale = detail ? age === null || isStale(age) : false
-  const readOnly =
-    Boolean(detail?.isDeal) || Boolean(detail?.checkerId) || stale
+  // 与评论一致：以列表状态为准，避免多举报案件被详情里的旧 checkerId 锁死。
+  const claimedByDetail = Boolean(detail?.isDeal) || Boolean(detail?.checkerId)
+  const claimedNow = claimed === null ? claimedByDetail : claimed
+  const readOnly = claimedNow || stale
   const link = detail ? compositionLink(detail.composition) : ""
 
   function chooseAction(action: Action) {
     if (readOnly) return
     setFormError("")
+    const template =
+      COMPOSITION_TEMPLATES[action as 2 | 3] ?? COMPOSITION_TEMPLATES[3]
     setForm((current) => ({
       ...current,
       action,
       userMessage: isTemplate(current.userMessage, "user")
-        ? TEMPLATES[action].user
+        ? template.user
         : current.userMessage,
       reporterMessage: isTemplate(current.reporterMessage, "reporter")
-        ? TEMPLATES[action].reporter
+        ? template.reporter
         : current.reporterMessage,
     }))
   }
@@ -5763,13 +5806,16 @@ function CompositionReviewPane({
     if (!form.remark.trim() || !form.reporterMessage.trim()) {
       return setFormError("请填写受理备注和举报人站内信")
     }
+    // 下架必须给作者发站内信；正常显示不需要，也不发送这个字段。
+    if (form.action === 2 && !form.userMessage.trim()) {
+      return setFormError("下架需要填写被举报人站内信")
+    }
     setSubmitting(true)
     try {
       await api.verifyComposition(detail.reportId, {
         action: form.action,
         remark: form.remark.trim(),
-        // 作品审核不向被举报人发站内信，传空即可。
-        userMessage: "",
+        userMessage: form.action === 2 ? form.userMessage.trim() : "",
         reporterMessage: form.reporterMessage.trim(),
       })
       onSubmitted({
@@ -5945,9 +5991,7 @@ function CompositionReviewPane({
                     <Icon name={stale ? "clock" : "check"} size={15} />
                     {stale
                       ? "该作品举报已超过一周或时间无法确认，系统不再提交。"
-                      : detail.isDeal
-                        ? "该作品案件已处理，仅可查看。"
-                        : "该作品案件已被其他审核员认领，仅可查看。"}
+                      : "该作品案件已被认领，仅可查看。"}
                   </p>
                 )}
                 <div className="form-row">
@@ -5956,7 +6000,7 @@ function CompositionReviewPane({
                     label="受理结果"
                     value={form.action}
                     onChange={chooseAction}
-                    options={ACTIONS}
+                    options={COMPOSITION_ACTIONS}
                     disabled={readOnly}
                   />
                 </div>
@@ -5969,6 +6013,17 @@ function CompositionReviewPane({
                   disabled={readOnly}
                   onChange={(remark) => update({ remark })}
                 />
+                {form.action === 2 && (
+                  <TextArea
+                    label="被举报人站内信"
+                    hint="下架时发送给作品作者"
+                    rows={3}
+                    value={form.userMessage}
+                    placeholder="例如：您的作品存在违规内容，已被下架…"
+                    disabled={readOnly}
+                    onChange={(userMessage) => update({ userMessage })}
+                  />
+                )}
                 <TextArea
                   label="举报人站内信"
                   value={form.reporterMessage}
@@ -6045,8 +6100,8 @@ function CompositionHistoryRow({
         <strong>{record.title || "未命名作品"}</strong>
         <span className="history-id">#{record.caseId}</span>
         {record.action && (
-          <span className={`case-badge ${ACTION_TONE[record.action]}`}>
-            {actionLabel(record.action)}
+          <span className={`case-badge ${compositionTone(record.action)}`}>
+            {compositionActionLabel(record.action)}
           </span>
         )}
         {record.source === "synced" && (

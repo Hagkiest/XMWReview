@@ -29,21 +29,31 @@ pub fn text(value: &Value) -> String {
 pub struct JudgedRef {
     pub case_id: i64,
     pub judge_record_id: i64,
+    /// 判决列表自带 `opinionInfo` 的赞同/反对计数（含审核员自己那一票）。
+    /// 有它就不必再请求 myOpinion——那个接口对已经投过票的案件会回 107005。
+    pub opinion: Option<(i64, i64)>,
 }
 
 /// 满意度 = (赞同数 - 1) / ((赞同数 - 1) + 反对数)。
 ///
-/// myOpinion 返回的 userAgreeNum 含审核员自己那一票，减 1 才是其他用户的赞同数；
+/// 赞同数含审核员自己那一票，减 1 才是其他用户的赞同数；
 /// 上游返回的 userAgreeRatio 口径不准（和实际计数对不上），所以只拿计数自己算。
 /// 除审核员自己外还没人评价时返回 None。
-pub fn opinion_satisfaction(value: &Value) -> Option<f32> {
-    let agree = (int(&value["userAgreeNum"]).unwrap_or(0) - 1).max(0);
-    let disagree = int(&value["userDisagreeNum"]).unwrap_or(0).max(0);
+pub fn satisfaction_from_counts(agree: i64, disagree: i64) -> Option<f32> {
+    let agree = (agree - 1).max(0);
+    let disagree = disagree.max(0);
     let total = agree + disagree;
     if total <= 0 {
         return None;
     }
     Some((agree as f32 / total as f32).clamp(0.0, 1.0))
+}
+
+pub fn opinion_satisfaction(value: &Value) -> Option<f32> {
+    satisfaction_from_counts(
+        int(&value["userAgreeNum"]).unwrap_or(0),
+        int(&value["userDisagreeNum"]).unwrap_or(0),
+    )
 }
 
 #[derive(Clone)]
@@ -187,7 +197,21 @@ impl Community {
                             .or_else(|| int(&item["caseId"]))
                             .unwrap_or(0);
                         let judge_record_id = int(&item["judgeRecordId"]).unwrap_or(0);
-                        (case_id > 0).then_some(JudgedRef { case_id, judge_record_id })
+                        // 判决列表自带 opinionInfo，直接拿来算满意度；
+                        // 已经投过票的案件再调 myOpinion 会回 107005。
+                        let opinion = (item["opinionInfo"].is_object())
+                            .then(|| {
+                                (
+                                    int(&item["opinionInfo"]["userAgreeNum"]).unwrap_or(0),
+                                    int(&item["opinionInfo"]["userDisagreeNum"]).unwrap_or(0),
+                                )
+                            })
+                            .filter(|(agree, disagree)| *agree > 0 || *disagree > 0);
+                        (case_id > 0).then_some(JudgedRef {
+                            case_id,
+                            judge_record_id,
+                            opinion,
+                        })
                     })
                     .collect()
             })
@@ -202,7 +226,7 @@ impl Community {
         token: &str,
         wanted: &[i64],
         max_pages: u32,
-    ) -> Result<std::collections::HashMap<i64, i64>, ApiError> {
+    ) -> Result<std::collections::HashMap<i64, JudgedRef>, ApiError> {
         let wanted: std::collections::HashSet<i64> =
             wanted.iter().copied().filter(|id| *id > 0).collect();
         let mut found = std::collections::HashMap::new();
@@ -214,7 +238,7 @@ impl Community {
             let (total, refs) = self.judged_refs(token, page, JUDGED_PAGE_SIZE).await?;
             for item in refs {
                 if item.judge_record_id > 0 && wanted.contains(&item.case_id) {
-                    found.insert(item.case_id, item.judge_record_id);
+                    found.insert(item.case_id, item);
                 }
             }
             if found.len() >= wanted.len() || page >= max_pages {
@@ -365,31 +389,13 @@ impl Community {
         case: &CaseDetail,
         action: u8,
         remark: &str,
+        user_message: &str,
         reporter_message: &str,
     ) -> Result<usize, ApiError> {
-        let ids: Vec<i64> = case
-            .reports
-            .iter()
-            .map(|report| report.id)
-            .filter(|id| *id > 0)
-            .collect();
-        if ids.is_empty() {
-            return Err(ApiError::BadRequest("未找到可受理的举报记录".to_string()));
-        }
-        // 作品审核与评论审核的请求体不同：不向被举报人发站内信（userIsSend=0），
-        // 也不带 userMessage。字段与网页端 verify-composition 保持一致。
-        let payload = json!({
-            "reportId": case.report_id,
-            "reporterIsSend": 1,
-            "userIsSend": 0,
-            "reportDetailIds": ids,
-            "action": action,
-            "remark": remark,
-            "reporterMessage": reporter_message,
-        });
+        let payload = composition_verify_body(case, action, remark, user_message, reporter_message)?;
         self.call(token, Method::POST, "/report/verify-composition", &[], Some(&payload))
             .await?;
-        Ok(ids.len())
+        Ok(1)
     }
 
     pub async fn case_detail(&self, token: &str, report_id: i64) -> Result<CaseDetail, ApiError> {
@@ -433,22 +439,9 @@ impl Community {
         user_message: &str,
         reporter_message: &str,
     ) -> Result<usize, ApiError> {
-        let ids: Vec<i64> = case.reports.iter().map(|r| r.id).filter(|id| *id > 0).collect();
-        if ids.is_empty() {
-            return Err(ApiError::BadRequest("未找到可受理的举报记录".to_string()));
-        }
-        let payload = json!({
-            "reportId": case.report_id,
-            "reporterIsSend": 1,
-            "userIsSend": 1,
-            "reportDetailIds": ids,
-            "action": action,
-            "remark": remark,
-            "userMessage": user_message,
-            "reporterMessage": reporter_message,
-        });
+        let payload = comment_verify_body(case, action, remark, user_message, reporter_message)?;
         self.verify(token, &payload).await?;
-        Ok(ids.len())
+        Ok(1)
     }
 }
 
@@ -622,6 +615,65 @@ fn image_url(value: &Value) -> Option<String> {
         .filter(|url| !url.trim().is_empty())
 }
 
+/// 受理记录只取最新那一条：get-info 的 list 按举报时间倒序，list[0].id 才是本次要处理的。
+fn latest_report_id(case: &CaseDetail) -> Result<i64, ApiError> {
+    case.reports
+        .first()
+        .map(|report| report.id)
+        .filter(|id| *id > 0)
+        .ok_or_else(|| ApiError::BadRequest("未找到可受理的举报记录".to_string()))
+}
+
+/// 评论审核请求体：action 1 = 正常显示（不发站内信），2 = 替换，3 = 删除（发站内信）。
+pub(crate) fn comment_verify_body(
+    case: &CaseDetail,
+    action: u8,
+    remark: &str,
+    user_message: &str,
+    reporter_message: &str,
+) -> Result<Value, ApiError> {
+    let report_id = latest_report_id(case)?;
+    let notify_user = action != 1;
+    let mut payload = json!({
+        "reportId": case.report_id,
+        "reporterIsSend": 1,
+        "userIsSend": if notify_user { 1 } else { 0 },
+        "reportDetailIds": [report_id],
+        "action": action,
+        "remark": remark,
+        "reporterMessage": reporter_message,
+    });
+    if notify_user {
+        payload["userMessage"] = json!(user_message);
+    }
+    Ok(payload)
+}
+
+/// 作品审核请求体：action 2 = 下架（必须给作者发站内信），3 = 正常显示（不发）。
+pub(crate) fn composition_verify_body(
+    case: &CaseDetail,
+    action: u8,
+    remark: &str,
+    user_message: &str,
+    reporter_message: &str,
+) -> Result<Value, ApiError> {
+    let report_id = latest_report_id(case)?;
+    let notify_user = action == 2;
+    let mut payload = json!({
+        "reportId": case.report_id,
+        "reporterIsSend": 1,
+        "userIsSend": if notify_user { 1 } else { 0 },
+        "reportDetailIds": [report_id],
+        "action": action,
+        "remark": remark,
+        "reporterMessage": reporter_message,
+    });
+    if notify_user {
+        payload["userMessage"] = json!(user_message);
+    }
+    Ok(payload)
+}
+
 impl CaseDetail {
     /// 列表接口不返回认领信息，只有 get-info 的 list 里有；
     /// 该 list 按举报时间倒序（最新在前），所以第一条的 checkerName 就是
@@ -758,6 +810,16 @@ mod tests {
     }
 
     #[test]
+    fn judged_list_counts_give_satisfaction() {
+        // 与线上一致：userAgreeNum 含审核员自己那一票（5 → 其他 4 票赞同），反对 1。
+        assert_eq!(satisfaction_from_counts(5, 1), Some(0.8));
+        // 只有审核员自己投过票 → 还没有满意度。
+        assert_eq!(satisfaction_from_counts(1, 0), None);
+        assert_eq!(satisfaction_from_counts(0, 0), None);
+        assert_eq!(satisfaction_from_counts(0, 3), Some(0.0));
+    }
+
+    #[test]
     fn latest_report_decides_claim() {
         // 真实形状：多条举报按时间倒序，最新那条 checkerName 为 "--"，
         // 更早那条已经被同一个人处理过。认领状态只看最新的这条。
@@ -773,4 +835,47 @@ mod tests {
         assert_eq!(parsed.report_num, 2);
         assert!(crate::auto::unclaimed(&parsed.latest_checker_name().unwrap()));
     }
+    fn sample_case() -> CaseDetail {
+        // 与线上一致：list 按时间倒序，最新一条未认领，旧的一条已被处理。
+        let detail = json!({
+            "list": [
+                { "id": 80445, "createTimeFormat": "2026-11-01 09:10", "checkerId": 0, "checkerName": "--" },
+                { "id": 80443, "createTimeFormat": "2026-11-01 07:56", "checkerId": 3369552, "checkerName": "Hagkiest" }
+            ],
+            "report": { "id": 57886, "targetType": "compose", "reportNum": 2, "lastReportTime": 1793491860 }
+        });
+        CaseDetail::from_value(&detail, 57886)
+    }
+
+    #[test]
+    fn composition_body_matches_official_shape() {
+        let case = sample_case();
+        // 正常显示：action=3，不发站内信，也没有 userMessage 字段。
+        let body = composition_verify_body(&case, 3, "无违规", "", "感谢您对社区内容的正义维护，您的举报已受理。").unwrap();
+        assert_eq!(body["action"], 3);
+        assert_eq!(body["userIsSend"], 0);
+        assert!(body.get("userMessage").is_none());
+        assert_eq!(body["reportDetailIds"], json!([80445]));
+
+        // 下架：action=2，必须带 userIsSend=1 和 userMessage，且只受理最新那条举报。
+        let body = composition_verify_body(&case, 2, "人身攻击", "您的作品存在违规内容", "感谢您对社区内容的正义维护，您的举报已受理。").unwrap();
+        assert_eq!(body["action"], 2);
+        assert_eq!(body["userIsSend"], 1);
+        assert_eq!(body["userMessage"], "您的作品存在违规内容");
+        assert_eq!(body["reportDetailIds"], json!([80445]));
+    }
+
+    #[test]
+    fn comment_body_omits_user_message_for_normal_display() {
+        let case = sample_case();
+        let body = comment_verify_body(&case, 1, "未发现违规", "不该出现", "感谢您对社区内容的正义维护，经核查该内容未发现违规。").unwrap();
+        assert_eq!(body["userIsSend"], 0);
+        assert!(body.get("userMessage").is_none());
+        assert_eq!(body["reportDetailIds"], json!([80445]));
+
+        let body = comment_verify_body(&case, 3, "辱骂", "您的评论已被删除", "感谢您对社区内容的正义维护，您的举报已受理。").unwrap();
+        assert_eq!(body["userIsSend"], 1);
+        assert_eq!(body["userMessage"], "您的评论已被删除");
+    }
+
 }

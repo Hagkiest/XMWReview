@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::{
     auto::AutoRuntime,
-    community::Community,
+    community::{satisfaction_from_counts, Community},
     log,
     records::{self, RecordsStore},
 };
@@ -38,6 +38,8 @@ pub struct Refreshed {
     pub satisfaction: Option<f32>,
     /// 这次是否真正取到了满意度；false 表示上游报错，下次再试。
     pub fetched: bool,
+    /// 这条记录这种来源的获取机会已经用过了（手动/自动各一次）。
+    pub skipped: bool,
 }
 
 impl Refreshed {
@@ -47,6 +49,7 @@ impl Refreshed {
             "judgeRecordId": self.judge_record_id,
             "satisfaction": self.satisfaction,
             "fetched": self.fetched,
+            "skipped": self.skipped,
         })
     }
 }
@@ -62,6 +65,7 @@ pub async fn refresh_batch(
     account_key: Option<&str>,
     items: &[(i64, i64)],
     max_pages: u32,
+    source: &str,
 ) -> Vec<Refreshed> {
     let wanted: Vec<i64> = items.iter().map(|(case_id, _)| *case_id).collect();
     // 「正常显示」的案件没有满意度：按记录里的 action 直接跳过，
@@ -82,13 +86,35 @@ pub async fn refresh_batch(
     };
 
     let mut results = Vec::with_capacity(items.len());
+    // 每个案件手动 / 自动各只有一次机会，只有真正取到值才算用掉。
+    let slots = match account_key {
+        Some(key) => records.satisfaction_slots(key, &wanted).await.unwrap_or_default(),
+        None => HashMap::new(),
+    };
     for (case_id, hint) in items {
         if *case_id <= 0 || excluded.contains(case_id) {
             continue;
         }
-        let matched = index.get(case_id).copied().unwrap_or(0);
-        let judge_record_id = if matched > 0 { matched } else { (*hint).max(0) };
+        let (manual_used, auto_used) = slots.get(case_id).copied().unwrap_or((false, false));
+        let already_used = if source == "manual" { manual_used } else { auto_used };
+        if already_used {
+            results.push(Refreshed {
+                case_id: *case_id,
+                judge_record_id: 0,
+                satisfaction: None,
+                fetched: false,
+                skipped: true,
+            });
+            continue;
+        }
+        let entry = index.get(case_id);
+        let judge_record_id = entry
+            .map(|item| item.judge_record_id)
+            .filter(|id| *id > 0)
+            .unwrap_or((*hint).max(0));
         if judge_record_id <= 0 {
+            // 判决列表里还没有这个案件（没出判决 / 还没被处罚），下一轮再试，不消耗机会。
+            log(format!("[satisfaction] 案件#{case_id} 还不在判决列表里，稍后再试"));
             if let Some(key) = account_key {
                 let _ = records.mark_satisfaction_attempt(key, *case_id).await;
             }
@@ -97,6 +123,7 @@ pub async fn refresh_batch(
                 judge_record_id: 0,
                 satisfaction: None,
                 fetched: false,
+                skipped: false,
             });
             continue;
         }
@@ -106,23 +133,35 @@ pub async fn refresh_batch(
             judge_record_id,
             satisfaction: None,
             fetched: false,
+            skipped: false,
         };
-        match community.satisfaction(token, judge_record_id).await {
-            Ok(satisfaction) => {
-                result.satisfaction = satisfaction;
+        // 判决列表自带 opinionInfo 时直接算：已经投过票的案件再调 myOpinion 会回 107005。
+        let outcome = match entry.and_then(|item| item.opinion) {
+            Some((agree, disagree)) => Ok(satisfaction_from_counts(agree, disagree)),
+            None => community.satisfaction(token, judge_record_id).await,
+        };
+        match outcome {
+            Ok(Some(satisfaction)) => {
+                result.satisfaction = Some(satisfaction);
                 result.fetched = true;
                 if let Some(key) = account_key {
                     if let Err(error) = records
-                        .set_satisfaction_by_key(key, *case_id, judge_record_id, satisfaction)
+                        .set_satisfaction_by_key(key, *case_id, judge_record_id, Some(satisfaction), source)
                         .await
                     {
                         log(format!("[satisfaction] 案件#{case_id} 写回失败：{error}"));
                     }
                 }
             }
+            Ok(None) => {
+                // 还没有其他用户投票：不算取到，机会保留，只记一次时间过一阵再试。
+                if let Some(key) = account_key {
+                    let _ = records.mark_satisfaction_attempt(key, *case_id).await;
+                }
+            }
             Err(error) => {
                 log(format!("[satisfaction] 案件#{case_id} 取满意度失败：{error}"));
-                // 失败也记一次时间：后台下一轮就不会反复撞同一个案件，明天再试。
+                // 失败不消耗机会，只记一次时间，后台下一轮不会马上再撞同一个案件。
                 if let Some(key) = account_key {
                     let _ = records.mark_satisfaction_attempt(key, *case_id).await;
                 }
@@ -170,7 +209,7 @@ async fn run_once(
         return Ok(());
     }
     // 判决列表只扫一遍：批量按案件号匹配 judgeRecordId。
-    let results = refresh_batch(records, community, &token, Some(&key), &due, BACKGROUND_PAGES).await;
+    let results = refresh_batch(records, community, &token, Some(&key), &due, BACKGROUND_PAGES, "auto").await;
     let fetched = results.iter().filter(|item| item.fetched).count();
     log(format!(
         "[satisfaction] 本轮刷新 {fetched}/{} 条满意度",
